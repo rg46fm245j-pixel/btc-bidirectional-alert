@@ -10,11 +10,12 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - int(days * 24 * 60 * 60 * 1000)
     rows = []
-    cursor = start_ms
+    cursor = start_ms   
     while cursor < end_ms:
         r = requests.get(
-            f"{BASE_URL}/fapi/v1/klines",
-            params={"symbol": symbol, "interval": interval, "startTime": cursor,
+            f"{BASE_URL}/fapi/v1/continuousKlines",
+            params={"pair": symbol, "contractType": "PERPETUAL",
+                    "interval": interval, "startTime": cursor,
                     "endTime": end_ms, "limit": 1500},
             timeout=20
         )
