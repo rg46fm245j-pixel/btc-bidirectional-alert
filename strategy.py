@@ -5,46 +5,84 @@ import numpy as np
 
 BASE_URL = "https://fapi.binance.com"
 
+
 def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
-    """Fetch public USDⓈ-M Futures candles. No API key or trading permission required."""
-    end_ms = int(time.time() * 1000)
-    start_ms = end_ms - int(days * 24 * 60 * 60 * 1000)
+    """Fetch Kraken Futures BTC candles for backtesting."""
+    interval_ms_map = {
+        "5m": 5 * 60 * 1000,
+        "15m": 15 * 60 * 1000,
+        "1h": 60 * 60 * 1000,
+    }
+
+    if interval not in interval_ms_map:
+        raise ValueError("仅支持 5m、15m 和 1h 周期。")
+
+    interval_ms = interval_ms_map[interval]
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - int(days * 24 * 60 * 60 * 1000)
+
+    cursor_sec = start_ms // 1000
+    end_sec = now_ms // 1000
     rows = []
-    cursor = start_ms   
-    while cursor < end_ms:
-        r = requests.get(
-            f"{BASE_URL}/fapi/v1/continuousKlines",
-            params={"pair": symbol, "contractType": "PERPETUAL",
-                    "interval": interval, "startTime": cursor,
-                    "endTime": end_ms, "limit": 1500},
-            timeout=20
+
+    while cursor_sec < end_sec:
+        response = requests.get(
+            f"https://futures.kraken.com/api/charts/v1/trade/PF_XBTUSD/{interval}",
+            params={
+                "from": cursor_sec,
+                "to": end_sec,
+                "count": 500,
+            },
+            timeout=30,
         )
-        r.raise_for_status()
-        batch = r.json()
+        response.raise_for_status()
+        payload = response.json()
+        batch = payload.get("candles", [])
+
         if not batch:
             break
+
         rows.extend(batch)
-        next_cursor = int(batch[-1][0]) + 1
-        if next_cursor <= cursor:
+
+        last_ms = int(batch[-1]["time"])
+        next_cursor = (last_ms + interval_ms) // 1000
+
+        if next_cursor <= cursor_sec:
             break
-        cursor = next_cursor
-        if len(batch) < 1500:
+
+        cursor_sec = next_cursor
+
+        if not payload.get("more_candles", False):
             break
+
         time.sleep(0.15)
 
     if not rows:
-        raise RuntimeError("没有获取到K线数据。")
-    cols = ["open_time","open","high","low","close","volume","close_time",
-            "quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"]
-    df = pd.DataFrame(rows, columns=cols)
-    df = df.drop_duplicates("open_time").sort_values("open_time")
-    for c in ["open","high","low","close","volume","taker_buy_base","taker_buy_quote"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        raise RuntimeError("Kraken 没有返回 K 线数据，请稍后重试。")
+
+    df = pd.DataFrame(rows)
+    df = df.drop_duplicates("time").sort_values("time").copy()
+    df["open_time"] = pd.to_numeric(df["time"], errors="coerce").astype("int64")
+
+    for column in ["open", "high", "low", "close", "volume"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
     df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    # Exclude the currently forming candle.
-    now_ms = int(time.time() * 1000)
-    df = df[df["close_time"].astype("int64") < now_ms].copy()
+    df["close_time"] = df["open_time"] + interval_ms - 1
+
+    # Keep only completed candles.
+    df = df[df["close_time"] < now_ms].copy()
+
+    # Keep the columns expected by the existing backtest code.
+    for column in [
+        "quote_volume", "trades", "taker_buy_base",
+        "taker_buy_quote", "ignore"
+    ]:
+        df[column] = 0
+
+    df = df.dropna(subset=["open", "high", "low", "close", "volume"])
     return df.reset_index(drop=True)
+
 
 def rsi(series, period=14):
     delta = series.diff()
