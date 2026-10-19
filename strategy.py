@@ -5,10 +5,19 @@ import numpy as np
 
 
 KRAKEN_URL = "https://futures.kraken.com/api/charts/v1/trade/PF_XBTUSD"
+UTC_US = "datetime64[us, UTC]"
+
+
+def normalize_time(series):
+    """统一为 UTC 微秒精度，避免 merge_asof 时间类型冲突。"""
+    return pd.to_datetime(series, utc=True).astype(UTC_US)
 
 
 def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
-    """获取 Kraken PF_XBTUSD 期货 K 线；不是 Binance BTCUSDT 行情。"""
+    """
+    获取 Kraken PF_XBTUSD 期货 K 线。
+    注意：这是 Kraken 合约，不是 Binance BTCUSDT 合约。
+    """
     interval_ms_map = {
         "5m": 5 * 60 * 1000,
         "15m": 15 * 60 * 1000,
@@ -17,6 +26,8 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
 
     if interval not in interval_ms_map:
         raise ValueError("仅支持 5m、15m 和 1h 周期。")
+    if days <= 0:
+        raise ValueError("days 必须大于 0。")
 
     interval_ms = interval_ms_map[interval]
     now_ms = int(time.time() * 1000)
@@ -24,8 +35,13 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
     end_sec = now_ms // 1000
     cursor_sec = start_sec
     rows = []
+    seen_cursors = set()
 
     while cursor_sec < end_sec:
+        if cursor_sec in seen_cursors:
+            break
+        seen_cursors.add(cursor_sec)
+
         response = requests.get(
             f"{KRAKEN_URL}/{interval}",
             params={
@@ -43,7 +59,17 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
             break
 
         rows.extend(batch)
-        last_ms = int(batch[-1]["time"])
+
+        batch_times = pd.to_numeric(
+            pd.Series([item["time"] for item in batch]),
+            errors="coerce",
+        ).dropna()
+
+        if batch_times.empty:
+            break
+
+        # 使用这一批中最大的时间，避免依赖接口返回顺序。
+        last_ms = int(batch_times.max())
         next_cursor = (last_ms + interval_ms) // 1000
 
         if next_cursor <= cursor_sec:
@@ -51,20 +77,23 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
 
         cursor_sec = next_cursor
 
+        # 如果接口明确表示没有更多历史 K 线，就停止。
         if not payload.get("more_candles", False):
             break
 
         time.sleep(0.15)
 
     if not rows:
-        raise RuntimeError("Kraken 没有返回 K 线数据，请稍后重试。")
+        raise RuntimeError(
+            "Kraken 没有返回 K 线数据，请稍后重试。"
+        )
 
     df = pd.DataFrame(rows)
     df = df.drop_duplicates("time").sort_values("time").copy()
+
     df["open_time"] = pd.to_numeric(
         df["time"], errors="coerce"
     )
-
     df = df.dropna(subset=["open_time"])
     df["open_time"] = df["open_time"].astype("int64")
 
@@ -73,13 +102,19 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
 
     df["time"] = pd.to_datetime(
         df["open_time"], unit="ms", utc=True
-    )
+    ).astype(UTC_US)
+
     df["close_time"] = df["open_time"] + interval_ms - 1
+
+    # 排除尚未收盘的 K 线。
     df = df[df["close_time"] < now_ms].copy()
 
     for col in [
-        "quote_volume", "trades", "taker_buy_base",
-        "taker_buy_quote", "ignore"
+        "quote_volume",
+        "trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "ignore",
     ]:
         df[col] = 0
 
@@ -110,10 +145,14 @@ def rsi(series, period=14):
     rs = avg_gain / avg_loss.replace(0, np.nan)
     result = 100 - (100 / (1 + rs))
 
-    # 持续上涨时 RSI 为 100，而不是空值。
+    # 持续上涨时 RSI 为 100；持续下跌时 RSI 为 0。
     result = result.mask(
         (avg_loss == 0) & (avg_gain > 0), 100.0
     )
+    result = result.mask(
+        (avg_gain == 0) & (avg_loss > 0), 0.0
+    )
+
     return result
 
 
@@ -122,17 +161,21 @@ def add_indicators(df):
         raise ValueError("K 线数据为空。")
 
     x = df.copy()
-    x["time"] = pd.to_datetime(x["time"], utc=True)
+
+    # 第一次统一时间精度。
+    x["time"] = normalize_time(x["time"])
+
     x = (
         x.drop_duplicates("time")
         .sort_values("time")
         .reset_index(drop=True)
     )
 
-    base = x.set_index("time")
+    # 使用规范化后的 UTC 时间作为索引。
+    base = x.set_index("time").sort_index()
 
     def resample_bars(rule):
-        return (
+        result = (
             base.resample(
                 rule,
                 label="left",
@@ -145,11 +188,20 @@ def add_indicators(df):
                 "close": "last",
                 "volume": "sum",
             })
-            .dropna(subset=["open", "high", "low", "close"])
+            .dropna(
+                subset=["open", "high", "low", "close"]
+            )
         )
+        result.index = pd.DatetimeIndex(
+            result.index
+        ).astype(UTC_US)
+        return result
 
+    # -------------------------
     # 15 分钟指标
+    # -------------------------
     x15 = resample_bars("15min")
+
     x15["rsi15"] = rsi(x15["close"], 14)
 
     ma20 = x15["close"].rolling(20).mean()
@@ -157,47 +209,94 @@ def add_indicators(df):
 
     x15["bb_lower"] = ma20 - 2 * std20
     x15["bb_upper"] = ma20 + 2 * std20
-    x15["prior_low"] = x15["low"].rolling(20).min().shift(1)
-    x15["prior_high"] = x15["high"].rolling(20).max().shift(1)
 
-    # 只有到了该 15 分钟 K 线的结束时间，指标才可使用。
+    x15["prior_low"] = (
+        x15["low"].rolling(20).min().shift(1)
+    )
+    x15["prior_high"] = (
+        x15["high"].rolling(20).max().shift(1)
+    )
+
     x15 = x15.reset_index()
-    x15["time"] = x15["time"] + pd.Timedelta(minutes=15)
+    x15["time"] = normalize_time(
+        x15["time"] + pd.Timedelta(minutes=15)
+    )
+
+    # merge_asof 两侧均明确使用 UTC 微秒精度。
+    left = x.sort_values("time").copy()
+    right15 = (
+        x15[
+            [
+                "time",
+                "rsi15",
+                "bb_lower",
+                "bb_upper",
+                "prior_low",
+                "prior_high",
+            ]
+        ]
+        .sort_values("time")
+        .copy()
+    )
+
+    left["time"] = normalize_time(left["time"])
+    right15["time"] = normalize_time(right15["time"])
 
     x = pd.merge_asof(
-        x.sort_values("time"),
-        x15[
-            ["time", "rsi15", "bb_lower", "bb_upper",
-             "prior_low", "prior_high"]
-        ].sort_values("time"),
+        left,
+        right15,
         on="time",
         direction="backward",
         allow_exact_matches=True,
     )
 
+    # -------------------------
     # 1 小时趋势指标
+    # -------------------------
     x1h = resample_bars("1h")
+
     x1h["ema50"] = x1h["close"].ewm(
-        span=50, adjust=False, min_periods=50
+        span=50,
+        adjust=False,
+        min_periods=50,
     ).mean()
+
     x1h["ema_slope"] = x1h["ema50"].pct_change(3)
 
-    # 1 小时 K 线结束后才能将其指标合并到 5 分钟数据。
     x1h = x1h.reset_index()
-    x1h["time"] = x1h["time"] + pd.Timedelta(hours=1)
+    x1h["time"] = normalize_time(
+        x1h["time"] + pd.Timedelta(hours=1)
+    )
+
+    left = x.sort_values("time").copy()
+    right1h = (
+        x1h[["time", "ema50", "ema_slope"]]
+        .sort_values("time")
+        .copy()
+    )
+
+    left["time"] = normalize_time(left["time"])
+    right1h["time"] = normalize_time(right1h["time"])
 
     x = pd.merge_asof(
-        x.sort_values("time"),
-        x1h[["time", "ema50", "ema_slope"]].sort_values("time"),
+        left,
+        right1h,
         on="time",
         direction="backward",
         allow_exact_matches=True,
     )
 
+    # -------------------------
     # 5 分钟反转确认
+    # -------------------------
     x["rsi5"] = rsi(x["close"], 14)
-    x["recent_low"] = x["low"].rolling(12).min().shift(1)
-    x["recent_high"] = x["high"].rolling(12).max().shift(1)
+
+    x["recent_low"] = (
+        x["low"].rolling(12).min().shift(1)
+    )
+    x["recent_high"] = (
+        x["high"].rolling(12).max().shift(1)
+    )
 
     x["long_confirm"] = (
         (x["close"] > x["recent_high"])
@@ -215,7 +314,7 @@ def add_indicators(df):
         )
     )
 
-    # 候选区域：仍然使用严格的研究条件，不直接放宽 RSI。
+    # 保留原有严格候选条件。
     x["long_candidate"] = (
         (x["rsi15"] < 30)
         & (x["close"] < x["bb_lower"])
@@ -228,8 +327,7 @@ def add_indicators(df):
         & (x["high"] >= x["prior_high"])
     )
 
-    # 允许候选出现后，在随后 6 根 5 分钟 K 线内确认。
-    # rolling(7) 包含当前 K 线及之前 6 根。
+    # 候选出现后，允许当前及随后 6 根 K 线确认。
     x["long_setup"] = (
         x["long_candidate"]
         .rolling(7, min_periods=1)
@@ -246,11 +344,14 @@ def add_indicators(df):
         .astype(bool)
     )
 
-    x["regime_ok"] = (
-        x["ema_slope"].abs() < 0.025
-    )
+    x["regime_ok"] = x["ema_slope"].abs() < 0.025
 
-    return x.reset_index(drop=True)
+    x["time"] = normalize_time(x["time"])
+
+    return (
+        x.sort_values("time")
+        .reset_index(drop=True)
+    )
 
 
 def run_backtest(
@@ -266,7 +367,9 @@ def run_backtest(
     if initial_capital <= 0:
         raise ValueError("初始资金必须大于 0。")
     if not 0 < risk_pct <= 0.01:
-        raise ValueError("单笔风险比例必须大于 0 且不超过 1%。")
+        raise ValueError(
+            "单笔风险比例必须大于 0 且不超过 1%。"
+        )
     if fee_bps < 0 or slippage_bps < 0:
         raise ValueError("手续费和滑点不能为负数。")
     if min_rr < 1:
@@ -275,21 +378,24 @@ def run_backtest(
     equity = float(initial_capital)
     peak = equity
     max_dd = 0.0
+
     trades = []
     curve = []
     position = None
+
     fee_rate = fee_bps / 10000
     slip_rate = slippage_bps / 10000
     cooldown_until = -1
 
-    # 诊断：统计每一层条件的数量。
     diag = {
         "bars": len(x),
         "long_candidate": int(x["long_candidate"].sum()),
         "short_candidate": int(x["short_candidate"].sum()),
         "long_confirm": int(x["long_confirm"].sum()),
         "short_confirm": int(x["short_confirm"].sum()),
-        "regime_ok": int(x["regime_ok"].fillna(False).sum()),
+        "regime_ok": int(
+            x["regime_ok"].fillna(False).sum()
+        ),
         "long_setup_confirm": int(
             (x["long_setup"] & x["long_confirm"]).sum()
         ),
@@ -310,21 +416,25 @@ def run_backtest(
             "equity": equity,
         })
 
-        # 先处理已有仓位的止损止盈。
+        # 先处理已有仓位的止损和止盈。
         if position:
             exit_price = None
             reason = None
 
             if position["side"] == "LONG":
                 if row["low"] <= position["stop"]:
-                    exit_price, reason = position["stop"], "stop"
+                    exit_price = position["stop"]
+                    reason = "stop"
                 elif row["high"] >= position["target"]:
-                    exit_price, reason = position["target"], "target"
+                    exit_price = position["target"]
+                    reason = "target"
             else:
                 if row["high"] >= position["stop"]:
-                    exit_price, reason = position["stop"], "stop"
+                    exit_price = position["stop"]
+                    reason = "stop"
                 elif row["low"] <= position["target"]:
-                    exit_price, reason = position["target"], "target"
+                    exit_price = position["target"]
+                    reason = "target"
 
             if exit_price is not None:
                 exit_exec = exit_price * (
@@ -339,7 +449,8 @@ def run_backtest(
 
                 gross = (
                     (exit_exec - position["entry_exec"])
-                    * position["qty"] * direction
+                    * position["qty"]
+                    * direction
                 )
 
                 fees = (
@@ -363,10 +474,13 @@ def run_backtest(
                 position = None
                 cooldown_until = i + 2
                 peak = max(peak, equity)
-                max_dd = max(
-                    max_dd,
-                    (peak - equity) / peak if peak else 0,
-                )
+
+                if peak > 0:
+                    max_dd = max(
+                        max_dd,
+                        (peak - equity) / peak,
+                    )
+
                 continue
 
         if position or i < cooldown_until:
@@ -388,7 +502,7 @@ def run_backtest(
             diag["filtered_regime"] += 1
             continue
 
-        # 若同一根 K 线同时触发多空，跳过，避免方向歧义。
+        # 同一根 K 线同时触发多空时跳过。
         if long_signal and short_signal:
             continue
 
@@ -397,13 +511,15 @@ def run_backtest(
 
         if side == "LONG":
             stop = float(
-                min(row["low"], row["recent_low"]) * (1 - 0.001)
+                min(row["low"], row["recent_low"])
+                * (1 - 0.001)
             )
             risk_per_unit = entry - stop
             target = entry + min_rr * risk_per_unit
         else:
             stop = float(
-                max(row["high"], row["recent_high"]) * (1 + 0.001)
+                max(row["high"], row["recent_high"])
+                * (1 + 0.001)
             )
             risk_per_unit = stop - entry
             target = entry - min_rr * risk_per_unit
@@ -413,6 +529,8 @@ def run_backtest(
             or risk_per_unit <= 0
             or target <= 0
             or not np.isfinite(entry)
+            or not np.isfinite(stop)
+            or not np.isfinite(target)
         ):
             diag["filtered_risk"] += 1
             continue
@@ -436,7 +554,9 @@ def run_backtest(
             continue
 
         entry_exec = entry * (
-            1 + slip_rate if side == "LONG" else 1 - slip_rate
+            1 + slip_rate
+            if side == "LONG"
+            else 1 - slip_rate
         )
 
         position = {
@@ -464,11 +584,14 @@ def run_backtest(
             else 1 + slip_rate
         )
 
-        direction = 1 if position["side"] == "LONG" else -1
+        direction = (
+            1 if position["side"] == "LONG" else -1
+        )
 
         gross = (
             (exit_exec - position["entry_exec"])
-            * position["qty"] * direction
+            * position["qty"]
+            * direction
         )
 
         fees = (
@@ -490,29 +613,39 @@ def run_backtest(
         })
 
         peak = max(peak, equity)
-        max_dd = max(
-            max_dd,
-            (peak - equity) / peak if peak else 0,
-        )
+
+        if peak > 0:
+            max_dd = max(
+                max_dd,
+                (peak - equity) / peak,
+            )
 
     tdf = pd.DataFrame(trades)
 
     if len(tdf):
-        wins = tdf.loc[tdf["net_pnl"] > 0, "net_pnl"].sum()
-        losses = -tdf.loc[tdf["net_pnl"] < 0, "net_pnl"].sum()
+        wins = tdf.loc[
+            tdf["net_pnl"] > 0, "net_pnl"
+        ].sum()
 
-        pf = (
-            float(wins / losses)
-            if losses > 0
-            else (None if wins == 0 else float("inf"))
-        )
+        losses = -tdf.loc[
+            tdf["net_pnl"] < 0, "net_pnl"
+        ].sum()
+
+        if losses > 0:
+            pf = float(wins / losses)
+        elif wins > 0:
+            pf = float("inf")
+        else:
+            pf = None
 
         win_rate = float(
             (tdf["net_pnl"] > 0).mean() * 100
         )
         avg_trade = float(tdf["net_pnl"].mean())
     else:
-        pf, win_rate, avg_trade = None, 0.0, 0.0
+        pf = None
+        win_rate = 0.0
+        avg_trade = 0.0
 
     metrics = {
         "trades": int(len(tdf)),
