@@ -12,7 +12,7 @@ def normalize_time(series):
 
 
 def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
-    """使用 Kraken Futures 公共行情。数据是 PF_XBTUSD，不是币安 BTCUSDT。"""
+    """获取 Kraken Futures 公共 K 线；数据为 PF_XBTUSD，不是币安 BTCUSDT。"""
     interval_ms_map = {"5m": 300000, "15m": 900000, "1h": 3600000}
 
     if interval not in interval_ms_map:
@@ -93,10 +93,7 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
     ]:
         df[col] = 0
 
-    df = df.dropna(
-        subset=["open", "high", "low", "close", "volume"]
-    )
-
+    df = df.dropna(subset=["open", "high", "low", "close", "volume"])
     return df.reset_index(drop=True)
 
 
@@ -188,14 +185,16 @@ def add_indicators(df):
     )
 
     left = x.sort_values("time").copy()
-    right15 = x15[[
-        "time",
-        "rsi15",
-        "bb_lower",
-        "bb_upper",
-        "prior_low",
-        "prior_high",
-    ]].sort_values("time").copy()
+    right15 = x15[
+        [
+            "time",
+            "rsi15",
+            "bb_lower",
+            "bb_upper",
+            "prior_low",
+            "prior_high",
+        ]
+    ].sort_values("time").copy()
 
     left["time"] = normalize_time(left["time"])
     right15["time"] = normalize_time(right15["time"])
@@ -225,11 +224,9 @@ def add_indicators(df):
     )
 
     left = x.sort_values("time").copy()
-    right1h = x1h[[
-        "time",
-        "ema50",
-        "ema_slope",
-    ]].sort_values("time").copy()
+    right1h = x1h[
+        ["time", "ema50", "ema_slope"]
+    ].sort_values("time").copy()
 
     left["time"] = normalize_time(left["time"])
     right1h["time"] = normalize_time(right1h["time"])
@@ -242,7 +239,7 @@ def add_indicators(df):
         allow_exact_matches=True,
     )
 
-    # 5 分钟确认条件
+    # 5 分钟确认指标
     x["rsi5"] = rsi(x["close"], 14)
 
     x["recent_low"] = (
@@ -309,7 +306,13 @@ def run_backtest(
     fee_bps=5.0,
     slippage_bps=2.0,
     min_rr=2.0,
+    max_hold_bars=288,
 ):
+    """
+    历史回测，不会执行真实订单。
+    max_hold_bars 默认 288 根 K 线；
+    对于 5 分钟 K 线，相当于 24 小时。
+    """
     x = add_indicators(df)
 
     if initial_capital <= 0:
@@ -326,7 +329,14 @@ def run_backtest(
     if min_rr < 1:
         raise ValueError("最低盈亏比不能小于 1。")
 
-    # equity 为已实现权益；回撤同时考虑浮动盈亏
+    if (
+        not isinstance(max_hold_bars, int)
+        or max_hold_bars < 1
+    ):
+        raise ValueError(
+            "最长持仓 K 线数必须是大于等于 1 的整数。"
+        )
+
     equity = float(initial_capital)
     peak_equity = float(initial_capital)
     max_dd = 0.0
@@ -362,6 +372,10 @@ def run_backtest(
         "filtered_both_sides": 0,
         "entries": 0,
         "closed_trades": 0,
+        "exit_stop": 0,
+        "exit_target": 0,
+        "exit_time": 0,
+        "exit_end_of_data": 0,
     }
 
     def mark_to_market_equity(
@@ -369,7 +383,7 @@ def run_backtest(
         open_position,
         realized_equity,
     ):
-        """估算按当前价格平仓后的权益，包含估算手续费和滑点。"""
+        """估算按当前价格平仓后的权益，包含手续费和滑点估算。"""
         if open_position is None:
             return realized_equity
 
@@ -422,83 +436,121 @@ def run_backtest(
 
         return marked
 
-    for i in range(100, len(x) - 1):
-        row = x.iloc[i]
-        nxt = x.iloc[i + 1]
+    def close_position(pos, timestamp, exit_price, reason):
+        """结算一笔交易并记录实际平仓原因。"""
+        nonlocal equity
 
-        # 检查当前持仓的止损和止盈。
-        # 同一根 K 线内止损、止盈都可能触及时，保守地优先按止损处理。
+        exit_exec = exit_price * (
+            1 - slip_rate
+            if pos["side"] == "LONG"
+            else 1 + slip_rate
+        )
+
+        direction = 1 if pos["side"] == "LONG" else -1
+
+        gross = (
+            exit_exec - pos["entry_exec"]
+        ) * pos["qty"] * direction
+
+        fees = (
+            pos["entry_exec"] + exit_exec
+        ) * pos["qty"] * fee_rate
+
+        net = gross - fees
+        equity += net
+
+        trade = {
+            **pos,
+            "exit_time": timestamp,
+            "exit_price": float(exit_price),
+            "exit_exec": float(exit_exec),
+            "reason": reason,
+            "gross_pnl": float(gross),
+            "fees_est": float(fees),
+            "net_pnl": float(net),
+            "equity_after": float(equity),
+        }
+
+        trades.append(trade)
+
+        events.append({
+            "time": timestamp,
+            "event": "EXIT",
+            "side": pos["side"],
+            "price": float(exit_price),
+            "reason": reason,
+            "detail": (
+                f"净盈亏 {net:.4f}; "
+                f"手续费估算 {fees:.4f}"
+            ),
+        })
+
+        if reason == "stop":
+            diag["exit_stop"] += 1
+        elif reason == "target":
+            diag["exit_target"] += 1
+        elif reason == "time_exit":
+            diag["exit_time"] += 1
+        elif reason == "end_of_data":
+            diag["exit_end_of_data"] += 1
+
+        return trade
+
+    # 从第 101 根 K 线开始计算，给指标留出预热时间。
+    # 循环会检查最后一根 K 线的最高价和最低价。
+    for i in range(100, len(x)):
+        row = x.iloc[i]
+        just_closed = False
+
         if position is not None:
             exit_price = None
             reason = None
 
+            # 如果同一根 K 线同时触及止损和止盈，保守地先按止损处理。
             if position["side"] == "LONG":
-                if row["low"] <= position["stop"]:
+                if float(row["low"]) <= position["stop"]:
                     exit_price, reason = position["stop"], "stop"
-                elif row["high"] >= position["target"]:
+                elif float(row["high"]) >= position["target"]:
                     exit_price, reason = position["target"], "target"
             else:
-                if row["high"] >= position["stop"]:
+                if float(row["high"]) >= position["stop"]:
                     exit_price, reason = position["stop"], "stop"
-                elif row["low"] <= position["target"]:
+                elif float(row["low"]) <= position["target"]:
                     exit_price, reason = position["target"], "target"
 
+            # 止损、止盈都没有触发时，才检查最长持仓时间。
+            bars_held = i - position["entry_bar_index"]
+
+            if (
+                exit_price is None
+                and bars_held >= max_hold_bars
+            ):
+                exit_price = float(row["close"])
+                reason = "time_exit"
+
             if exit_price is not None:
-                exit_exec = exit_price * (
-                    1 - slip_rate
-                    if position["side"] == "LONG"
-                    else 1 + slip_rate
+                close_position(
+                    position,
+                    row["time"],
+                    float(exit_price),
+                    reason,
                 )
-
-                direction = (
-                    1 if position["side"] == "LONG" else -1
-                )
-
-                gross = (
-                    exit_exec - position["entry_exec"]
-                ) * position["qty"] * direction
-
-                fees = (
-                    position["entry_exec"] + exit_exec
-                ) * position["qty"] * fee_rate
-
-                net = gross - fees
-                equity += net
-
-                trades.append({
-                    **position,
-                    "exit_time": row["time"],
-                    "exit_price": exit_price,
-                    "exit_exec": exit_exec,
-                    "reason": reason,
-                    "gross_pnl": gross,
-                    "fees_est": fees,
-                    "net_pnl": net,
-                    "equity_after": equity,
-                })
-
-                events.append({
-                    "time": row["time"],
-                    "event": "EXIT",
-                    "side": position["side"],
-                    "price": exit_price,
-                    "reason": reason,
-                    "detail": (
-                        f"净盈亏 {net:.4f}; "
-                        f"手续费估算 {fees:.4f}"
-                    ),
-                })
 
                 position = None
                 cooldown_until = i + 2
+                just_closed = True
 
-        # 每根 K 线记录权益。若有持仓，则包含浮动盈亏。
+        # 记录每根 K 线的权益，包括浮动盈亏。
         record_equity(
             row["time"],
             float(row["close"]),
             position,
             equity,
         )
+
+        # 最后一根 K 线没有下一根 K 线可供入场，因此不再开新仓。
+        if i >= len(x) - 1 or just_closed:
+            continue
 
         long_signal = bool(
             row["long_setup"] and row["long_confirm"]
@@ -551,7 +603,7 @@ def run_backtest(
             continue
 
         side = side_label
-        entry = float(nxt["open"])
+        entry = float(x.iloc[i + 1]["open"])
 
         if side == "LONG":
             stop = float(
@@ -590,6 +642,7 @@ def run_backtest(
             continue
 
         risk_cash = equity * risk_pct
+
         qty = min(
             risk_cash / risk_per_unit,
             equity / entry,
@@ -609,7 +662,7 @@ def run_backtest(
 
         position = {
             "side": side,
-            "entry_time": nxt["time"],
+            "entry_time": x.iloc[i + 1]["time"],
             "entry_price": entry,
             "entry_exec": entry_exec,
             "stop": stop,
@@ -617,6 +670,7 @@ def run_backtest(
             "qty": qty,
             "risk_budget": risk_cash,
             "signal_time": row["time"],
+            "entry_bar_index": i + 1,
         }
 
         diag["entries"] += 1
@@ -627,68 +681,44 @@ def run_backtest(
             f"止损={stop:.4f}; "
             f"目标={target:.4f}; "
             f"数量={qty:.8f}; "
-            f"风险预算={risk_cash:.4f}"
+            f"风险预算={risk_cash:.4f}; "
+            f"最长持仓={max_hold_bars} 根K线"
         )
 
         events.append(event)
 
-    # 若数据结束时仍有持仓，按最后一根 K 线收盘价结算。
+    # 兜底：如果循环结束后仍有持仓，则按最后收盘价结算。
+    # 正常情况下，最后一根 K 线的止盈、止损和时间退出已先行检查。
     if position is not None and len(x):
         last = x.iloc[-1]
-        exit_price = float(last["close"])
 
-        exit_exec = exit_price * (
-            1 - slip_rate
-            if position["side"] == "LONG"
-            else 1 + slip_rate
+        close_position(
+            position,
+            last["time"],
+            float(last["close"]),
+            "end_of_data",
         )
 
-        direction = (
-            1 if position["side"] == "LONG" else -1
-        )
+        position = None
 
-        gross = (
-            exit_exec - position["entry_exec"]
-        ) * position["qty"] * direction
-
-        fees = (
-            position["entry_exec"] + exit_exec
-        ) * position["qty"] * fee_rate
-
-        net = gross - fees
-        equity += net
-
-        trades.append({
-            **position,
-            "exit_time": last["time"],
-            "exit_price": exit_price,
-            "exit_exec": exit_exec,
-            "reason": "end_of_data",
-            "gross_pnl": gross,
-            "fees_est": fees,
-            "net_pnl": net,
-            "equity_after": equity,
-        })
-
-        events.append({
-            "time": last["time"],
-            "event": "EXIT",
-            "side": position["side"],
-            "price": exit_price,
-            "reason": "数据结束时按收盘价平仓",
-            "detail": (
-                f"净盈亏 {net:.4f}; "
-                f"手续费估算 {fees:.4f}"
-            ),
-        })
-
-        # 把最后一次平仓后的最终权益写入曲线。
         record_equity(
             last["time"],
-            exit_price,
+            float(last["close"]),
             None,
             equity,
         )
+
+    # 确保权益曲线包含最后一根 K 线。
+    if len(x):
+        last_time = x.iloc[-1]["time"]
+
+        if not curve or curve[-1]["time"] != last_time:
+            record_equity(
+                last_time,
+                float(x.iloc[-1]["close"]),
+                position,
+                equity,
+            )
 
     diag["closed_trades"] = len(trades)
     tdf = pd.DataFrame(trades)
@@ -712,6 +742,7 @@ def run_backtest(
         win_rate = float(
             (tdf["net_pnl"] > 0).mean() * 100
         )
+
         avg_trade = float(tdf["net_pnl"].mean())
     else:
         pf = None
