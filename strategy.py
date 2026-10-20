@@ -3,19 +3,18 @@ import requests
 import pandas as pd
 import numpy as np
 
-# 历史回测专用，不会提交真实交易订单
+# 历史回测专用：不会发送真实订单
 KRAKEN_URL = "https://futures.kraken.com/api/charts/v1/trade/PF_XBTUSD"
 INTERVAL_SECONDS = {"5m": 300, "15m": 900, "1h": 3600}
 
 
 def normalize_timestamp(series):
-    """统一时间列为 UTC 纳秒精度，避免 merge_asof 时间类型冲突。"""
-    result = pd.to_datetime(series, utc=True, errors="coerce")
-    return result.astype("datetime64[ns, UTC]")
+    """统一为 UTC 时间戳。"""
+    return pd.to_datetime(series, utc=True, errors="coerce")
 
 
 def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
-    """获取 Kraken Futures 历史 K 线。"""
+    """获取 Kraken Futures PF_XBTUSD K线；symbol 参数仅兼容旧接口。"""
     if interval not in INTERVAL_SECONDS:
         raise ValueError("周期必须是 5m、15m 或 1h")
     if days <= 0:
@@ -26,7 +25,7 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
     start = now - int(days * 86400)
     rows = []
     cursor = start
-    max_pages = min(500, max(5, int(days * 86400 / seconds / 500) + 5))
+    max_pages = min(500, max(5, int(days * 86400 / seconds / 500) + 8))
 
     with requests.Session() as session:
         for _ in range(max_pages):
@@ -38,7 +37,6 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
             response.raise_for_status()
             payload = response.json()
             batch = payload.get("candles", [])
-
             if not batch:
                 break
 
@@ -71,22 +69,18 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
         raise RuntimeError("Kraken 没有返回 K 线数据，请稍后重试。")
 
     df = pd.DataFrame(rows)
-
     if "time" not in df.columns:
-        raise RuntimeError(
-            f"行情接口返回了意外字段：{list(df.columns)}"
-        )
+        raise RuntimeError(f"行情接口返回了意外字段：{list(df.columns)}")
 
     raw_time = pd.to_numeric(df["time"], errors="coerce")
     valid_times = raw_time.dropna()
-
     if valid_times.empty:
         raise RuntimeError("行情数据中的时间字段全部无效。")
 
     unit = "ms" if valid_times.median() > 10**11 else "s"
     df["timestamp"] = pd.to_datetime(
         raw_time, unit=unit, utc=True, errors="coerce"
-    ).astype("datetime64[ns, UTC]")
+    )
 
     for col in ["open", "high", "low", "close"]:
         if col not in df.columns:
@@ -108,7 +102,9 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
     end_time = pd.Timestamp(now, unit="s", tz="UTC")
 
     df = df[df["timestamp"] >= start_time]
-    df = df[df["timestamp"] + pd.Timedelta(seconds=seconds) <= end_time]
+    df = df[
+        df["timestamp"] + pd.Timedelta(seconds=seconds) <= end_time
+    ]
     df = df.drop_duplicates("timestamp", keep="last")
     df = df.sort_values("timestamp")
 
@@ -141,12 +137,11 @@ def rsi(series, period=14):
     result = result.mask(
         (avg_gain == 0) & (avg_loss > 0), 0.0
     )
-
     return result
 
 
 def add_indicators(df):
-    """计算指标，统一时间精度，并避免使用未收盘的高周期 K 线。"""
+    """计算指标；高周期指标只在对应K线收盘后生效。"""
     if df is None or df.empty:
         raise ValueError("K 线数据为空。")
 
@@ -193,53 +188,48 @@ def add_indicators(df):
             "close": "last",
             "volume": "sum",
         })
-
         return out.dropna(
             subset=["open", "high", "low", "close"]
         )
 
-    # 15 分钟指标
+    # 15分钟指标：15分钟K线结束后才可使用
     q = resample_bars("15min")
     q["rsi15"] = rsi(q["close"], 14)
 
-    mid = q["close"].rolling(20).mean()
-    sd = q["close"].rolling(20).std(ddof=0)
+    mid = q["close"].rolling(20, min_periods=20).mean()
+    sd = q["close"].rolling(20, min_periods=20).std(ddof=0)
 
     q["bb_lower"] = mid - 2 * sd
     q["bb_upper"] = mid + 2 * sd
-    q["prior_low"] = q["low"].rolling(20).min().shift(1)
-    q["prior_high"] = q["high"].rolling(20).max().shift(1)
+    q["prior_low"] = (
+        q["low"].rolling(20, min_periods=20).min().shift(1)
+    )
+    q["prior_high"] = (
+        q["high"].rolling(20, min_periods=20).max().shift(1)
+    )
 
     q = q.reset_index()
-    q["timestamp"] = normalize_timestamp(q["timestamp"])
     q["timestamp"] = (
-        q["timestamp"] + pd.Timedelta(minutes=15)
-    ).astype("datetime64[ns, UTC]")
-
-    # 合并前两侧统一成相同时间精度
-    left = x.copy()
-    left["timestamp"] = normalize_timestamp(left["timestamp"])
+        normalize_timestamp(q["timestamp"])
+        + pd.Timedelta(minutes=15)
+    )
 
     right15 = q[
         [
-            "timestamp", "rsi15", "bb_lower", "bb_upper",
-            "prior_low", "prior_high",
+            "timestamp", "rsi15", "bb_lower",
+            "bb_upper", "prior_low", "prior_high"
         ]
     ].copy()
-    right15["timestamp"] = normalize_timestamp(right15["timestamp"])
-
-    left = left.sort_values("timestamp").reset_index(drop=True)
-    right15 = right15.sort_values("timestamp").reset_index(drop=True)
 
     x = pd.merge_asof(
-        left,
-        right15,
+        x.sort_values("timestamp").reset_index(drop=True),
+        right15.sort_values("timestamp").reset_index(drop=True),
         on="timestamp",
         direction="backward",
         allow_exact_matches=True,
     )
 
-    # 1 小时趋势指标
+    # 1小时环境过滤：小时K线收盘后才可使用
     h = resample_bars("1h")
     h["ema50"] = h["close"].ewm(
         span=50, adjust=False, min_periods=50
@@ -247,56 +237,62 @@ def add_indicators(df):
     h["ema_slope"] = h["ema50"].pct_change(3)
 
     h = h.reset_index()
-    h["timestamp"] = normalize_timestamp(h["timestamp"])
     h["timestamp"] = (
-        h["timestamp"] + pd.Timedelta(hours=1)
-    ).astype("datetime64[ns, UTC]")
-
-    left = x.copy()
-    left["timestamp"] = normalize_timestamp(left["timestamp"])
+        normalize_timestamp(h["timestamp"])
+        + pd.Timedelta(hours=1)
+    )
 
     right1h = h[
         ["timestamp", "ema50", "ema_slope"]
     ].copy()
-    right1h["timestamp"] = normalize_timestamp(right1h["timestamp"])
-
-    left = left.sort_values("timestamp").reset_index(drop=True)
-    right1h = right1h.sort_values("timestamp").reset_index(drop=True)
 
     x = pd.merge_asof(
-        left,
-        right1h,
+        x.sort_values("timestamp").reset_index(drop=True),
+        right1h.sort_values("timestamp").reset_index(drop=True),
         on="timestamp",
         direction="backward",
         allow_exact_matches=True,
     )
 
+    # 5分钟反转确认
     x["rsi5"] = rsi(x["close"], 14)
-    x["recent_low"] = x["low"].rolling(12).min().shift(1)
-    x["recent_high"] = x["high"].rolling(12).max().shift(1)
+    x["recent_low"] = (
+        x["low"].rolling(12, min_periods=12).min().shift(1)
+    )
+    x["recent_high"] = (
+        x["high"].rolling(12, min_periods=12).max().shift(1)
+    )
 
     x["long_confirm"] = (
         (x["close"] > x["recent_high"])
-        & (x["close"].shift(1) <= x["recent_high"].shift(1))
-    )
+        & (
+            x["close"].shift(1)
+            <= x["recent_high"].shift(1)
+        )
+    ).fillna(False)
 
     x["short_confirm"] = (
         (x["close"] < x["recent_low"])
-        & (x["close"].shift(1) >= x["recent_low"].shift(1))
-    )
+        & (
+            x["close"].shift(1)
+            >= x["recent_low"].shift(1)
+        )
+    ).fillna(False)
 
+    # 保留原策略阈值，不为增加交易次数而放宽条件
     x["long_candidate"] = (
         (x["rsi15"] < 30)
         & (x["close"] < x["bb_lower"])
         & (x["low"] <= x["prior_low"])
-    )
+    ).fillna(False)
 
     x["short_candidate"] = (
         (x["rsi15"] > 70)
         & (x["close"] > x["bb_upper"])
         & (x["high"] >= x["prior_high"])
-    )
+    ).fillna(False)
 
+    # 候选信号在最近7根5分钟K线内有效
     x["long_setup"] = (
         x["long_candidate"]
         .rolling(7, min_periods=1)
@@ -313,7 +309,9 @@ def add_indicators(df):
         .astype(bool)
     )
 
-    x["regime_ok"] = x["ema_slope"].abs() < 0.025
+    x["regime_ok"] = (
+        x["ema_slope"].abs() < 0.025
+    ).fillna(False)
 
     return x.sort_values("timestamp").reset_index(drop=True)
 
@@ -327,7 +325,7 @@ def run_backtest(
     min_rr=2.0,
     max_hold_bars=288,
 ):
-    """历史回测，不会发送真实订单。"""
+    """历史回测；只模拟交易，不发送真实订单。"""
     if initial_capital <= 0:
         raise ValueError("初始资金必须大于 0。")
     if not 0 < risk_pct <= 0.01:
@@ -340,15 +338,15 @@ def run_backtest(
         raise ValueError("max_hold_bars 必须是正整数。")
 
     x = add_indicators(df)
-
     if len(x) < 101:
         raise ValueError("至少需要 101 根 K 线才能回测。")
 
     equity = float(initial_capital)
     peak_equity = equity
     max_dd = 0.0
-    fee = fee_bps / 10000.0
-    slip = slippage_bps / 10000.0
+
+    fee_rate = fee_bps / 10000.0
+    slip_rate = slippage_bps / 10000.0
 
     trades = []
     curve = []
@@ -356,7 +354,20 @@ def run_backtest(
     cooldown_until = -1
 
     diagnostics = {
-        "bars": len(x),
+        "bars": int(len(x)),
+        "long_candidate_bars": int(x["long_candidate"].sum()),
+        "short_candidate_bars": int(x["short_candidate"].sum()),
+        "long_setup_bars": int(x["long_setup"].sum()),
+        "short_setup_bars": int(x["short_setup"].sum()),
+        "long_confirm_bars": int(x["long_confirm"].sum()),
+        "short_confirm_bars": int(x["short_confirm"].sum()),
+        "long_setup_and_confirm": int(
+            (x["long_setup"] & x["long_confirm"]).sum()
+        ),
+        "short_setup_and_confirm": int(
+            (x["short_setup"] & x["short_confirm"]).sum()
+        ),
+        "regime_ok_bars": int(x["regime_ok"].sum()),
         "entries": 0,
         "closed_trades": 0,
         "exit_stop": 0,
@@ -367,18 +378,28 @@ def run_backtest(
         "filtered_risk": 0,
         "filtered_cooldown": 0,
         "filtered_existing_position": 0,
+        "filtered_ambiguous_signal": 0,
+        "filtered_invalid_stop": 0,
+        "filtered_gap_at_entry": 0,
     }
 
-    def adverse_exec(side, price):
+    def entry_execution(side, price):
+        # 开多买入滑点向上；开空卖出滑点向下
         return price * (
-            1 + slip if side == "LONG" else 1 - slip
+            1 + slip_rate if side == "LONG" else 1 - slip_rate
+        )
+
+    def exit_execution(side, price):
+        # 平多卖出滑点向下；平空买入滑点向上
+        return price * (
+            1 - slip_rate if side == "LONG" else 1 + slip_rate
         )
 
     def mark_equity(mark, pos):
         if pos is None:
             return equity
 
-        ex = adverse_exec(pos["side"], mark)
+        ex = exit_execution(pos["side"], float(mark))
         direction = 1 if pos["side"] == "LONG" else -1
 
         gross = (
@@ -386,163 +407,117 @@ def run_backtest(
             * pos["qty"]
             * direction
         )
-
-        fees = (
+        estimated_exit_fee = (
             (pos["entry_exec"] + ex)
             * pos["qty"]
-            * fee
+            * fee_rate
         )
 
-        return equity + gross - fees
+        return (
+            equity
+            + gross
+            - pos["entry_fee"]
+            - estimated_exit_fee
+        )
 
     def record_curve(timestamp, mark, pos):
         nonlocal peak_equity, max_dd
 
-        value = mark_equity(mark, pos)
+        value = float(mark_equity(mark, pos))
         peak_equity = max(peak_equity, value)
 
         if peak_equity > 0:
             max_dd = max(
                 max_dd,
-                (peak_equity - value) / peak_equity,
+                (peak_equity - value) / peak_equity
             )
 
         curve.append({
             "timestamp": timestamp,
-            "equity": float(value),
+            "equity": value,
             "realized_equity": float(equity),
         })
 
-    def close_position(pos, timestamp, trigger, reason, ex):
+    def close_position(pos, timestamp, trigger, reason, exec_price):
         nonlocal equity
 
         direction = 1 if pos["side"] == "LONG" else -1
-
         gross = (
-            (ex - pos["entry_exec"])
+            (exec_price - pos["entry_exec"])
             * pos["qty"]
             * direction
         )
 
-        fees = (
-            (pos["entry_exec"] + ex)
+        exit_fee = (
+            (pos["entry_exec"] + exec_price)
             * pos["qty"]
-            * fee
+            * fee_rate
         )
-
-        net = gross - fees
+        total_fees = pos["entry_fee"] + exit_fee
+        net = gross - total_fees
         equity += net
 
         trades.append({
             **pos,
             "exit_time": timestamp,
             "exit_price": float(trigger),
-            "exit_exec": float(ex),
+            "exit_exec": float(exec_price),
             "reason": reason,
             "gross_pnl": float(gross),
-            "fees_est": float(fees),
+            "entry_fee": float(pos["entry_fee"]),
+            "exit_fee": float(exit_fee),
+            "fees_est": float(total_fees),
             "net_pnl": float(net),
             "equity_after": float(equity),
         })
 
         diagnostics["closed_trades"] += 1
 
-        key = {
+        reason_key = {
             "stop": "exit_stop",
             "target": "exit_target",
             "time_exit": "exit_time",
             "end_of_data": "exit_end_of_data",
         }.get(reason)
 
-        if key:
-            diagnostics[key] += 1
+        if reason_key:
+            diagnostics[reason_key] += 1
 
-    def exit_exec(pos, bar, trigger, reason):
-        opening = float(bar["open"])
+    def get_exit(pos, bar):
+        op = float(bar["open"])
+        hi = float(bar["high"])
+        lo = float(bar["low"])
+
         side = pos["side"]
+        stop = pos["stop"]
+        target = pos["target"]
 
-        if reason == "stop":
-            gap = (
-                side == "LONG" and opening <= trigger
-            ) or (
-                side == "SHORT" and opening >= trigger
-            )
-        elif reason == "target":
-            gap = (
-                side == "LONG" and opening >= trigger
-            ) or (
-                side == "SHORT" and opening <= trigger
-            )
+        # 跳空时按开盘价处理；同一根K线同时触及止损止盈时先止损
+        if side == "LONG":
+            if op <= stop:
+                return op, "stop"
+            if op >= target:
+                return op, "target"
+            hit_stop = lo <= stop
+            hit_target = hi >= target
         else:
-            gap = False
+            if op >= stop:
+                return op, "stop"
+            if op <= target:
+                return op, "target"
+            hit_stop = hi >= stop
+            hit_target = lo <= target
 
-        base_price = opening if gap else trigger
-        return adverse_exec(side, base_price)
+        if hit_stop:
+            return stop, "stop"
+        if hit_target:
+            return target, "target"
+
+        return None, None
 
     for i in range(100, len(x)):
         row = x.iloc[i]
         closed_this_bar = False
-
-        if position is not None:
-            opening = float(row["open"])
-            high = float(row["high"])
-            low = float(row["low"])
-
-            side = position["side"]
-            stop = position["stop"]
-            target = position["target"]
-            trigger = None
-            reason = None
-
-            # 同一根 K 线同时触及止损和止盈时，保守地先止损
-            if side == "LONG":
-                if opening <= stop or low <= stop:
-                    trigger, reason = stop, "stop"
-                elif opening >= target or high >= target:
-                    trigger, reason = target, "target"
-            else:
-                if opening >= stop or high >= stop:
-                    trigger, reason = stop, "stop"
-                elif opening <= target or low <= target:
-                    trigger, reason = target, "target"
-
-            held = i - position["entry_bar_index"]
-
-            if trigger is None and held >= max_hold_bars:
-                trigger = float(row["close"])
-                reason = "time_exit"
-
-            if trigger is not None:
-                ex = exit_exec(position, row, trigger, reason)
-
-                close_position(
-                    position,
-                    row["timestamp"],
-                    trigger,
-                    reason,
-                    ex,
-                )
-
-                position = None
-                cooldown_until = i + 2
-                closed_this_bar = True
-
-        record_curve(
-            row["timestamp"],
-            float(row["close"]),
-            position,
-        )
-
-        if (
-            closed_this_bar
-            or i >= len(x) - 1
-            or position is not None
-        ):
-            continue
-
-        if i < cooldown_until:
-            diagnostics["filtered_cooldown"] += 1
-            continue
 
         long_signal = bool(
             row["long_setup"] and row["long_confirm"]
@@ -550,11 +525,51 @@ def run_backtest(
         short_signal = bool(
             row["short_setup"] and row["short_confirm"]
         )
+        has_signal = long_signal or short_signal
 
-        if not long_signal and not short_signal:
+        if position is not None:
+            trigger, reason = get_exit(position, row)
+            held = i - position["entry_bar_index"]
+
+            if trigger is None and held >= max_hold_bars:
+                trigger = float(row["close"])
+                reason = "time_exit"
+
+            if trigger is not None:
+                ex = exit_execution(position["side"], trigger)
+                close_position(
+                    position,
+                    row["timestamp"],
+                    trigger,
+                    reason,
+                    ex,
+                )
+                position = None
+                cooldown_until = i + 2
+                closed_this_bar = True
+
+        record_curve(
+            row["timestamp"], float(row["close"]), position
+        )
+
+        if closed_this_bar or i >= len(x) - 1:
+            continue
+
+        if position is not None:
+            if has_signal:
+                diagnostics["filtered_existing_position"] += 1
+            continue
+
+        if i < cooldown_until:
+            if has_signal:
+                diagnostics["filtered_cooldown"] += 1
+            continue
+
+        if not has_signal:
             continue
 
         if long_signal and short_signal:
+            diagnostics["filtered_ambiguous_signal"] += 1
             continue
 
         if not bool(row["regime_ok"]):
@@ -562,34 +577,32 @@ def run_backtest(
             continue
 
         side = "LONG" if long_signal else "SHORT"
-        signal_close = float(row["close"])
-
         stop = float(
             row["low"] if side == "LONG" else row["high"]
         )
 
-        if not np.isfinite([signal_close, stop]).all():
-            diagnostics["filtered_risk"] += 1
-            continue
-
         next_bar = x.iloc[i + 1]
         entry_ref = float(next_bar["open"])
 
-        # 入场按下一根 K 线开盘模拟
-        entry_exec = (
-            entry_ref * (1 + slip)
-            if side == "LONG"
-            else entry_ref * (1 - slip)
-        )
+        # 下一根开盘已穿越止损价，放弃该信号
+        if (
+            (side == "LONG" and entry_ref <= stop)
+            or (side == "SHORT" and entry_ref >= stop)
+        ):
+            diagnostics["filtered_gap_at_entry"] += 1
+            continue
 
-        # 目标价按实际模拟入场价计算，避免信号收盘价偏差
         risk_distance = (
             entry_ref - stop
             if side == "LONG"
             else stop - entry_ref
         )
 
-        if not np.isfinite(risk_distance) or risk_distance <= 0:
+        if (
+            not np.isfinite([entry_ref, stop, risk_distance]).all()
+            or risk_distance <= 0
+        ):
+            diagnostics["filtered_invalid_stop"] += 1
             diagnostics["filtered_risk"] += 1
             continue
 
@@ -599,24 +612,32 @@ def run_backtest(
             else entry_ref - risk_distance * min_rr
         )
 
-        if target <= 0:
+        if not np.isfinite(target) or target <= 0:
             diagnostics["filtered_risk"] += 1
             continue
 
-        stop_exec = adverse_exec(side, stop)
+        entry_exec = entry_execution(side, entry_ref)
+        stop_exec = exit_execution(side, stop)
         direction = 1 if side == "LONG" else -1
 
         unit_gross_loss = max(
             0.0,
-            (entry_exec - stop_exec) * direction,
+            (entry_exec - stop_exec) * direction
         )
 
-        unit_fees = (entry_exec + stop_exec) * fee
-        unit_risk = unit_gross_loss + unit_fees
+        entry_fee_per_unit = entry_exec * fee_rate
+        exit_fee_per_unit = stop_exec * fee_rate
+        unit_risk = (
+            unit_gross_loss
+            + entry_fee_per_unit
+            + exit_fee_per_unit
+        )
         risk_budget = equity * risk_pct
 
         if (
-            not np.isfinite([entry_ref, entry_exec, unit_risk]).all()
+            not np.isfinite([
+                entry_exec, stop_exec, unit_risk, risk_budget
+            ]).all()
             or unit_risk <= 0
             or risk_budget <= 0
         ):
@@ -624,6 +645,12 @@ def run_backtest(
             continue
 
         qty = risk_budget / unit_risk
+
+        if not np.isfinite(qty) or qty <= 0:
+            diagnostics["filtered_risk"] += 1
+            continue
+
+        entry_fee = entry_exec * qty * fee_rate
 
         position = {
             "side": side,
@@ -637,15 +664,16 @@ def run_backtest(
             "qty": float(qty),
             "risk_budget": float(risk_budget),
             "estimated_unit_risk": float(unit_risk),
+            "entry_fee": float(entry_fee),
         }
 
         diagnostics["entries"] += 1
 
-    # 数据结束时强制平仓，避免遗漏未实现盈亏
+    # 数据结束仍有持仓时，按最后收盘价强制平仓
     if position is not None:
         last = x.iloc[-1]
         trigger = float(last["close"])
-        ex = adverse_exec(position["side"], trigger)
+        ex = exit_execution(position["side"], trigger)
 
         close_position(
             position,
@@ -654,7 +682,6 @@ def run_backtest(
             "end_of_data",
             ex,
         )
-
         position = None
         record_curve(last["timestamp"], trigger, None)
 
@@ -665,13 +692,14 @@ def run_backtest(
         win_rate = 0.0
         profit_factor = 0.0
         avg_pnl = 0.0
+        total_fees = 0.0
+        trade_net_sum = 0.0
     else:
         wins = float(
             trades_df.loc[
                 trades_df["net_pnl"] > 0, "net_pnl"
             ].sum()
         )
-
         losses = float(
             -trades_df.loc[
                 trades_df["net_pnl"] < 0, "net_pnl"
@@ -682,14 +710,15 @@ def run_backtest(
             (trades_df["net_pnl"] > 0).mean() * 100
         )
 
-        if losses > 0:
-            profit_factor = wins / losses
-        elif wins > 0:
-            profit_factor = float("inf")
-        else:
-            profit_factor = 0.0
+        profit_factor = (
+            wins / losses
+            if losses > 0
+            else (float("inf") if wins > 0 else 0.0)
+        )
 
         avg_pnl = float(trades_df["net_pnl"].mean())
+        total_fees = float(trades_df["fees_est"].sum())
+        trade_net_sum = float(trades_df["net_pnl"].sum())
 
     summary = {
         "initial_capital": float(initial_capital),
@@ -703,9 +732,11 @@ def run_backtest(
         "profit_factor": float(profit_factor),
         "max_drawdown_pct": float(max_dd * 100),
         "avg_net_pnl": avg_pnl,
-        "fees_estimated": float(
-            trades_df["fees_est"].sum()
-        ) if not trades_df.empty else 0.0,
+        "fees_estimated": total_fees,
+        "trade_net_pnl_sum": trade_net_sum,
+        "reconciliation_diff": float(
+            (equity - initial_capital) - trade_net_sum
+        ),
         "data_start": str(x["timestamp"].iloc[0]),
         "data_end": str(x["timestamp"].iloc[-1]),
         "data_bars": int(len(x)),
@@ -719,9 +750,10 @@ def run_backtest(
         "simulation_only": True,
         "model_limitations": [
             "数据来自 Kraken Futures PF_XBTUSD，不是币安 BTCUSDT。",
-            "成交价、滑点及 K 线内的成交先后顺序采用简化模拟。",
-            "同一根 K 线同时触及止损和止盈时，优先按止损处理。",
-            "尚未模拟资金费率、强平、市场冲击及交易所合约规则。",
+            "使用K线级别的简化成交模拟，无法还原真实订单簿成交。",
+            "同一根K线同时触及止损和止盈时，保守地优先按止损处理。",
+            "未模拟资金费率、强平、市场冲击和全部交易所合约规则。",
+            "信号确认后按下一根K线开盘入场；如果开盘已穿越止损，则跳过该信号。",
         ],
     }
 
