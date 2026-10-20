@@ -1,14 +1,15 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+
 from strategy import fetch_klines, run_backtest
 
 st.set_page_config(
-    page_title="BTC Reversal Intelligence v1.3",
-    layout="wide"
+    page_title="BTC Reversal Intelligence v1.4",
+    layout="wide",
 )
 
-st.title("BTC Reversal Intelligence v1.3")
+st.title("BTC Reversal Intelligence v1.4")
 st.caption(
     "Kraken BTC 期货反转策略 · 历史回测与诊断 · 不发送真实订单"
 )
@@ -19,14 +20,14 @@ with st.sidebar:
     days = st.selectbox(
         "历史数据范围（天）",
         [7, 14, 30, 60, 90],
-        index=0
+        index=0,
     )
 
     capital = st.number_input(
         "模拟初始资金（USDT）",
         min_value=100.0,
         value=10000.0,
-        step=500.0
+        step=500.0,
     )
 
     risk_pct = st.number_input(
@@ -34,21 +35,21 @@ with st.sidebar:
         min_value=0.1,
         max_value=1.0,
         value=0.5,
-        step=0.1
+        step=0.1,
     )
 
     fee_bps = st.number_input(
         "单边手续费（bps）",
         min_value=0.0,
         value=5.0,
-        step=0.5
+        step=0.5,
     )
 
     slippage_bps = st.number_input(
         "单边滑点假设（bps）",
         min_value=0.0,
         value=2.0,
-        step=0.5
+        step=0.5,
     )
 
     min_rr = st.number_input(
@@ -56,7 +57,7 @@ with st.sidebar:
         min_value=1.0,
         max_value=5.0,
         value=2.0,
-        step=0.25
+        step=0.25,
     )
 
     max_hold_bars = st.number_input(
@@ -64,101 +65,88 @@ with st.sidebar:
         min_value=1,
         max_value=2880,
         value=288,
-        step=12
+        step=12,
     )
 
 st.warning(
-    "本程序使用 Kraken Futures 的 PF_XBTUSD 公开行情，"
-    "并非 Binance BTCUSDT。当前为历史回测原型，"
-    "没有历史订单簿重放，也没有精确计入资金费率。"
-    "不会发送真实交易订单。"
+    "本程序使用 Kraken Futures 的 PF_XBTUSD 公开行情，并非 Binance BTCUSDT。"
+    "这是历史回测原型，不含历史订单簿重放和精确资金费率，不会发送真实订单。"
 )
 
 if st.button("获取行情并运行回测", type="primary"):
-
     try:
         with st.spinner("正在获取行情并运行回测……"):
-
-            # 1. 获取历史行情
             df = fetch_klines(
                 days=int(days),
-                interval="5m"
+                interval="5m",
             )
 
             if df is None or df.empty:
                 st.error("行情接口没有返回可用的 K 线数据。")
                 st.stop()
 
-            # 2. 兼容 timestamp / time 两种时间列名称
-            if "timestamp" in df.columns:
-                time_col = "timestamp"
-            elif "time" in df.columns:
-                time_col = "time"
-            else:
-                st.error(
-                    "行情数据缺少时间列。实际列名为："
-                    + ", ".join(map(str, df.columns))
-                )
-                st.stop()
+            if "timestamp" not in df.columns:
+                if "time" in df.columns:
+                    df = df.rename(
+                        columns={"time": "timestamp"}
+                    )
+                else:
+                    st.error(
+                        "行情数据缺少时间列。实际列名："
+                        + ", ".join(map(str, df.columns))
+                    )
+                    st.stop()
 
             df = df.copy()
-            df[time_col] = pd.to_datetime(
-                df[time_col],
+            df["timestamp"] = pd.to_datetime(
+                df["timestamp"],
                 utc=True,
-                errors="coerce"
+                errors="coerce",
             )
 
-            df = df.dropna(subset=[time_col])
-            df = df.sort_values(time_col).reset_index(drop=True)
+            for col in ["open", "high", "low", "close"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(
+                        df[col],
+                        errors="coerce",
+                    )
 
-            required_columns = [
-                "open", "high", "low", "close"
-            ]
-            missing = [
-                col for col in required_columns
-                if col not in df.columns
-            ]
-
-            if missing:
-                st.error(
-                    "行情数据缺少必要字段："
-                    + ", ".join(missing)
-                )
-                st.stop()
+            df = df.dropna(
+                subset=[
+                    "timestamp", "open", "high", "low", "close"
+                ]
+            )
+            df = df.drop_duplicates("timestamp")
+            df = df.sort_values("timestamp").reset_index(drop=True)
 
             if df.empty:
-                st.error("清理无效时间数据后，没有剩余 K 线。")
+                st.error("清理无效行情后没有剩余数据。")
                 st.stop()
 
-            first_time = df[time_col].min()
-            last_time = df[time_col].max()
-
+            first_time = df["timestamp"].min()
+            last_time = df["timestamp"].max()
             actual_days = (
                 last_time - first_time
             ).total_seconds() / 86400
 
             st.success(
-                f"行情获取成功：共 {len(df)} 根 K 线"
+                f"行情获取成功：共 {len(df)} 根已收盘 K 线"
             )
 
             c1, c2 = st.columns(2)
             c1.write(f"数据开始时间：{first_time}")
             c2.write(f"数据结束时间：{last_time}")
-
             c1.write(f"实际覆盖：{actual_days:.2f} 天")
             c2.write(
-                f"最新收盘价："
-                f"{float(df['close'].iloc[-1]):,.2f}"
+                f"最新收盘价：{float(df['close'].iloc[-1]):,.2f}"
             )
 
             if actual_days < days * 0.9:
                 st.warning(
-                    f"你选择了 {days} 天，"
-                    f"但实际覆盖只有 {actual_days:.2f} 天。"
-                    "当前回测可能缺少足够的历史样本。"
+                    f"你选择了 {days} 天，但实际覆盖只有 "
+                    f"{actual_days:.2f} 天；样本可能不足。"
                 )
 
-            # 3. 执行历史回测
             result = run_backtest(
                 df,
                 initial_capital=float(capital),
@@ -166,40 +154,27 @@ if st.button("获取行情并运行回测", type="primary"):
                 fee_bps=float(fee_bps),
                 slippage_bps=float(slippage_bps),
                 min_rr=float(min_rr),
-                max_hold_bars=int(max_hold_bars)
+                max_hold_bars=int(max_hold_bars),
             )
 
-            # 当前 strategy.py 返回 summary，而不是 metrics
             summary = result.get("summary", {})
 
             if not summary:
                 st.error(
-                    "回测没有返回 summary。"
-                    "请检查 strategy.py 的返回结构。"
+                    "回测没有返回 summary，请检查 strategy.py。"
                 )
                 st.stop()
 
             trades = result.get("trades", pd.DataFrame())
-            equity = result.get(
-                "equity_curve",
-                pd.DataFrame()
-            )
-            indicators = result.get(
-                "indicators",
-                pd.DataFrame()
-            )
-
+            equity = result.get("equity_curve", pd.DataFrame())
+            indicators = result.get("indicators", pd.DataFrame())
             diagnostics = summary.get("diagnostics", {})
 
-            # 4. 回测指标
+            # 回测总览
             st.subheader("回测指标")
 
-            net_pnl = float(summary.get("total_pnl", 0))
-            return_pct = float(
-                summary.get("total_return_pct", 0)
-            )
-            trade_count = int(summary.get("trades", 0))
-            win_rate = float(summary.get("win_rate", 0))
+            pnl = float(summary.get("total_pnl", 0))
+            ret = float(summary.get("total_return_pct", 0))
             pf = summary.get("profit_factor", 0)
 
             if pf is None:
@@ -212,108 +187,111 @@ if st.button("获取行情并运行回测", type="primary"):
             cols = st.columns(4)
             cols[0].metric(
                 "净收益",
-                f"{net_pnl:.2f} USDT",
-                f"{return_pct:.2f}%"
+                f"{pnl:.2f} USDT",
+                f"{ret:.2f}%",
             )
-            cols[1].metric("已结束交易", str(trade_count))
-            cols[2].metric("胜率", f"{win_rate:.1f}%")
+            cols[1].metric(
+                "已结束交易",
+                str(int(summary.get("trades", 0))),
+            )
+            cols[2].metric(
+                "胜率",
+                f"{float(summary.get('win_rate', 0)):.1f}%",
+            )
             cols[3].metric("盈利因子", pf_text)
 
             cols = st.columns(4)
             cols[0].metric(
                 "最大回撤",
-                f"{float(summary.get('max_drawdown_pct', 0)):.2f}%"
+                f"{float(summary.get('max_drawdown_pct', 0)):.2f}%",
             )
             cols[1].metric(
                 "平均每笔净收益",
-                f"{float(summary.get('avg_net_pnl', 0)):.2f} USDT"
+                f"{float(summary.get('avg_net_pnl', 0)):.2f} USDT",
             )
             cols[2].metric(
                 "期末权益",
-                f"{float(summary.get('end_equity', capital)):.2f} USDT"
+                f"{float(summary.get('end_equity', capital)):.2f} USDT",
             )
             cols[3].metric(
                 "估算手续费",
-                f"{float(summary.get('fees_estimated', 0)):.2f} USDT"
+                f"{float(summary.get('fees_estimated', 0)):.2f} USDT",
             )
 
-            # 5. 退出原因与诊断
-            st.subheader("退出原因与策略诊断")
+            # 信号诊断
+            st.subheader("交易信号诊断")
 
-            exit_keys = {
-                "止损退出": "exit_stop",
-                "止盈退出": "exit_target",
-                "时间退出": "exit_time",
-                "数据结束退出": "exit_end_of_data"
+            diagnostic_labels = {
+                "bars": "参与回测的K线数",
+                "long_candidate_bars": "做多候选K线数",
+                "short_candidate_bars": "做空候选K线数",
+                "long_setup_bars": "做多候选有效K线数",
+                "short_setup_bars": "做空候选有效K线数",
+                "long_confirm_bars": "做多确认K线数",
+                "short_confirm_bars": "做空确认K线数",
+                "long_setup_and_confirm": "做多候选且确认",
+                "short_setup_and_confirm": "做空候选且确认",
+                "regime_ok_bars": "环境过滤通过K线数",
+                "entries": "实际开仓次数",
+                "closed_trades": "已结束交易数",
+                "filtered_regime": "被环境过滤拒绝",
+                "filtered_risk": "被风险检查拒绝",
+                "filtered_invalid_stop": "无效止损拒绝",
+                "filtered_gap_at_entry": "开盘跳过止损拒绝",
+                "filtered_cooldown": "冷却期过滤",
+                "filtered_existing_position": "持仓期间忽略信号",
+                "filtered_ambiguous_signal": "多空信号冲突",
+                "exit_stop": "止损退出",
+                "exit_target": "止盈退出",
+                "exit_time": "时间退出",
+                "exit_end_of_data": "数据结束退出",
             }
 
-            cols = st.columns(4)
-            for col, (label, key) in zip(
-                cols, exit_keys.items()
-            ):
-                col.metric(
-                    label,
-                    str(diagnostics.get(key, 0))
-                )
+            diag_df = pd.DataFrame([
+                {
+                    "诊断项目": label,
+                    "数值": int(diagnostics.get(key, 0)),
+                }
+                for key, label in diagnostic_labels.items()
+            ])
 
-            if diagnostics.get("exit_end_of_data", 0) > 0:
+            st.dataframe(
+                diag_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            if int(summary.get("trades", 0)) < 30:
                 st.warning(
-                    "存在因数据结束而退出的交易。"
-                    "这些交易不一定满足最长持仓时间，"
-                    "请在评估策略时单独关注。"
+                    "交易样本少于 30 笔，不能据此判断长期策略优势。"
+                    "请根据上面的信号诊断定位瓶颈，不要先放宽策略条件。"
                 )
 
-            if trade_count < 30:
+            if pnl < 0:
                 st.warning(
-                    "当前交易样本少于 30 笔，"
-                    "不足以可靠判断策略是否具有长期优势。"
+                    "本次回测净亏损。请先检查交易明细、成交假设和"
+                    "过滤统计，不要为了增加交易次数而随意放宽条件。"
                 )
 
-            if net_pnl < 0:
-                st.warning(
-                    "本次回测净亏损。"
-                    "请先分析交易明细，不要为了提高交易次数"
-                    "而随意放宽策略条件。"
-                )
-
-            if diagnostics:
-                diagnostic_df = pd.DataFrame([
-                    {"诊断项目": k, "数量": v}
-                    for k, v in diagnostics.items()
-                ])
-                st.dataframe(
-                    diagnostic_df,
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-            # 6. 权益曲线
+            # 权益曲线
             st.subheader("权益曲线")
 
             if (
                 isinstance(equity, pd.DataFrame)
                 and not equity.empty
-                and {"timestamp", "equity"}.issubset(
-                    equity.columns
-                )
+                and {"timestamp", "equity"}.issubset(equity.columns)
             ):
-                curve = equity[
-                    ["timestamp", "equity"]
-                ].copy()
-
+                curve = equity[["timestamp", "equity"]].copy()
                 curve["timestamp"] = pd.to_datetime(
                     curve["timestamp"],
                     utc=True,
-                    errors="coerce"
+                    errors="coerce",
                 )
                 curve["equity"] = pd.to_numeric(
                     curve["equity"],
-                    errors="coerce"
+                    errors="coerce",
                 )
-
-                curve = curve.dropna(
-                    subset=["timestamp", "equity"]
-                ).sort_values("timestamp")
+                curve = curve.dropna().sort_values("timestamp")
 
                 if not curve.empty:
                     st.line_chart(
@@ -321,53 +299,56 @@ if st.button("获取行情并运行回测", type="primary"):
                     )
 
                     peaks = curve["equity"].cummax()
-                    drawdowns = (
+                    dd = (
                         (peaks - curve["equity"])
                         / peaks.replace(0, np.nan)
                         * 100
                     )
 
                     st.caption(
-                        "按权益曲线估算的最大回撤："
-                        f"{drawdowns.max():.3f}%"
+                        f"按曲线估算的最大回撤：{dd.max():.3f}%"
                     )
             else:
-                st.info("当前没有可绘制的权益曲线。")
+                st.info("没有可绘制的权益曲线。")
 
-            # 7. 交易记录
+            # 交易明细
             st.subheader("交易记录")
 
-            if isinstance(trades, pd.DataFrame):
-                trade_df = trades.copy()
-            else:
-                trade_df = pd.DataFrame(trades)
+            trade_df = (
+                trades.copy()
+                if isinstance(trades, pd.DataFrame)
+                else pd.DataFrame(trades)
+            )
 
             if not trade_df.empty:
                 st.dataframe(
                     trade_df,
                     use_container_width=True,
-                    hide_index=True
+                    hide_index=True,
                 )
 
                 if "net_pnl" in trade_df.columns:
                     trade_sum = pd.to_numeric(
                         trade_df["net_pnl"],
-                        errors="coerce"
+                        errors="coerce",
                     ).sum()
 
-                    pnl_diff = trade_sum - net_pnl
+                    pnl_diff = trade_sum - pnl
 
                     st.write(
                         f"交易明细净利润合计：{trade_sum:.4f} USDT"
                     )
                     st.write(
-                        f"与回测净收益的差额：{pnl_diff:.6f} USDT"
+                        f"与回测总净收益的差额：{pnl_diff:.8f} USDT"
                     )
 
                     if abs(pnl_diff) > 0.01:
                         st.error(
-                            "交易明细与回测总净收益不一致，"
-                            "需要进一步检查权益结算逻辑。"
+                            "交易明细与总净收益不一致，需要检查结算逻辑。"
+                        )
+                    else:
+                        st.success(
+                            "交易明细与总净收益核对一致。"
                         )
 
                 st.download_button(
@@ -376,53 +357,58 @@ if st.button("获取行情并运行回测", type="primary"):
                         index=False
                     ).encode("utf-8-sig"),
                     file_name="kraken_btc_futures_trades.csv",
-                    mime="text/csv"
+                    mime="text/csv",
                 )
             else:
-                st.info("本次回测没有已结束的交易。")
+                st.info("本次回测没有已结束交易。")
 
-            # 8. 信号与指标数据
-            st.subheader("策略指标数据")
+            # 指标与信号
+            st.subheader("策略指标与信号数据")
 
             if (
                 isinstance(indicators, pd.DataFrame)
                 and not indicators.empty
             ):
                 signal_cols = [
-                    col for col in [
-                        "timestamp", "close",
-                        "rsi15", "rsi5",
-                        "long_setup", "short_setup",
-                        "long_confirm", "short_confirm",
-                        "regime_ok"
+                    c for c in [
+                        "timestamp",
+                        "close",
+                        "rsi15",
+                        "rsi5",
+                        "long_candidate",
+                        "short_candidate",
+                        "long_setup",
+                        "short_setup",
+                        "long_confirm",
+                        "short_confirm",
+                        "regime_ok",
+                        "ema_slope",
+                        "bb_lower",
+                        "bb_upper",
                     ]
-                    if col in indicators.columns
+                    if c in indicators.columns
                 ]
 
-                if signal_cols:
-                    st.dataframe(
-                        indicators[signal_cols].tail(200),
-                        use_container_width=True,
-                        hide_index=True
-                    )
+                st.dataframe(
+                    indicators[signal_cols].tail(200),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-                    st.download_button(
-                        "下载策略指标 CSV",
-                        data=indicators.to_csv(
-                            index=False
-                        ).encode("utf-8-sig"),
-                        file_name="btc_strategy_indicators.csv",
-                        mime="text/csv"
-                    )
-                else:
-                    st.info("指标表中没有可展示的预期字段。")
+                st.download_button(
+                    "下载完整策略指标 CSV",
+                    data=indicators.to_csv(
+                        index=False
+                    ).encode("utf-8-sig"),
+                    file_name="btc_strategy_indicators.csv",
+                    mime="text/csv",
+                )
             else:
                 st.info("策略没有返回指标数据。")
 
             st.caption(
-                "数据来源：Kraken Futures PF_XBTUSD。"
-                "回测包含手续费和滑点假设，但未精确模拟"
-                "资金费率、强平、市场冲击及所有合约规则。"
+                "数据来源：Kraken Futures PF_XBTUSD。回测为简化模拟，"
+                "未精确模拟资金费率、强平、订单簿冲击及所有合约规则。"
                 "本程序仅用于研究，不会发送真实订单。"
             )
 
@@ -433,12 +419,12 @@ if st.button("获取行情并运行回测", type="primary"):
 else:
     st.markdown("""
 ### 当前版本功能
-- 获取 Kraken BTC 期货公开 K 线
+- 获取 Kraken Futures 公开 K 线
 - 15 分钟候选区域与 5 分钟反转确认
 - 1 小时环境过滤
 - 可调整风险预算、止损止盈、手续费与滑点
-- 回测收益指标、权益曲线和交易记录
-- 下载交易记录与策略指标 CSV
+- 回测指标、权益曲线、交易明细
+- 信号过滤诊断与 CSV 导出
 
 ### 尚未包含
 - 历史订单簿深度回放
@@ -447,5 +433,5 @@ else:
 - 手机推送告警
 - 真实自动下单
 
-请先验证历史数据和回测结果，再考虑下一阶段。
+先验证历史数据、信号诊断和结算一致性，再考虑下一阶段。
 """)
