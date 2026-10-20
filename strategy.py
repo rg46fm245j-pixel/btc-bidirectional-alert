@@ -3,18 +3,17 @@ import requests
 import pandas as pd
 import numpy as np
 
-# 历史回测专用：不会发送真实订单
 KRAKEN_URL = "https://futures.kraken.com/api/charts/v1/trade/PF_XBTUSD"
 INTERVAL_SECONDS = {"5m": 300, "15m": 900, "1h": 3600}
 
 
 def normalize_timestamp(series):
-    """统一为 UTC 时间戳。"""
-    return pd.to_datetime(series, utc=True, errors="coerce")
+    """统一时间戳为 UTC，并强制使用纳秒精度，避免 merge_asof 类型冲突。"""
+    result = pd.to_datetime(series, utc=True, errors="coerce")
+    return result.dt.as_unit("ns")
 
 
 def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
-    """获取 Kraken Futures PF_XBTUSD K线；symbol 参数仅兼容旧接口。"""
     if interval not in INTERVAL_SECONDS:
         raise ValueError("周期必须是 5m、15m 或 1h")
     if days <= 0:
@@ -78,8 +77,8 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
         raise RuntimeError("行情数据中的时间字段全部无效。")
 
     unit = "ms" if valid_times.median() > 10**11 else "s"
-    df["timestamp"] = pd.to_datetime(
-        raw_time, unit=unit, utc=True, errors="coerce"
+    df["timestamp"] = normalize_timestamp(
+        pd.to_datetime(raw_time, unit=unit, utc=True, errors="coerce")
     )
 
     for col in ["open", "high", "low", "close"]:
@@ -110,6 +109,8 @@ def fetch_klines(days=30, symbol="BTCUSDT", interval="5m"):
 
     if df.empty:
         raise RuntimeError("没有获取到已收盘的 K 线。")
+
+    df["timestamp"] = normalize_timestamp(df["timestamp"])
 
     return df.reset_index(drop=True)[
         ["timestamp", "open", "high", "low", "close", "volume"]
@@ -176,6 +177,8 @@ def add_indicators(df):
     if x.empty:
         raise ValueError("清理无效数据后，没有剩余 K 线。")
 
+    # 再次显式统一主表时间类型
+    x["timestamp"] = normalize_timestamp(x["timestamp"])
     base = x.set_index("timestamp").sort_index()
 
     def resample_bars(rule):
@@ -192,7 +195,7 @@ def add_indicators(df):
             subset=["open", "high", "low", "close"]
         )
 
-    # 15分钟指标：15分钟K线结束后才可使用
+    # 15分钟指标
     q = resample_bars("15min")
     q["rsi15"] = rsi(q["close"], 14)
 
@@ -209,9 +212,8 @@ def add_indicators(df):
     )
 
     q = q.reset_index()
-    q["timestamp"] = (
-        normalize_timestamp(q["timestamp"])
-        + pd.Timedelta(minutes=15)
+    q["timestamp"] = normalize_timestamp(
+        q["timestamp"] + pd.Timedelta(minutes=15)
     )
 
     right15 = q[
@@ -221,6 +223,10 @@ def add_indicators(df):
         ]
     ].copy()
 
+    # merge_asof 两边的键都强制转换成同一时间精度
+    x["timestamp"] = normalize_timestamp(x["timestamp"])
+    right15["timestamp"] = normalize_timestamp(right15["timestamp"])
+
     x = pd.merge_asof(
         x.sort_values("timestamp").reset_index(drop=True),
         right15.sort_values("timestamp").reset_index(drop=True),
@@ -229,7 +235,7 @@ def add_indicators(df):
         allow_exact_matches=True,
     )
 
-    # 1小时环境过滤：小时K线收盘后才可使用
+    # 1小时环境过滤
     h = resample_bars("1h")
     h["ema50"] = h["close"].ewm(
         span=50, adjust=False, min_periods=50
@@ -237,14 +243,17 @@ def add_indicators(df):
     h["ema_slope"] = h["ema50"].pct_change(3)
 
     h = h.reset_index()
-    h["timestamp"] = (
-        normalize_timestamp(h["timestamp"])
-        + pd.Timedelta(hours=1)
+    h["timestamp"] = normalize_timestamp(
+        h["timestamp"] + pd.Timedelta(hours=1)
     )
 
     right1h = h[
         ["timestamp", "ema50", "ema_slope"]
     ].copy()
+
+    # 第二次合并前再次统一两边的键类型
+    x["timestamp"] = normalize_timestamp(x["timestamp"])
+    right1h["timestamp"] = normalize_timestamp(right1h["timestamp"])
 
     x = pd.merge_asof(
         x.sort_values("timestamp").reset_index(drop=True),
@@ -279,7 +288,7 @@ def add_indicators(df):
         )
     ).fillna(False)
 
-    # 保留原策略阈值，不为增加交易次数而放宽条件
+    # 保持原策略条件不变
     x["long_candidate"] = (
         (x["rsi15"] < 30)
         & (x["close"] < x["bb_lower"])
@@ -292,7 +301,6 @@ def add_indicators(df):
         & (x["high"] >= x["prior_high"])
     ).fillna(False)
 
-    # 候选信号在最近7根5分钟K线内有效
     x["long_setup"] = (
         x["long_candidate"]
         .rolling(7, min_periods=1)
@@ -325,7 +333,6 @@ def run_backtest(
     min_rr=2.0,
     max_hold_bars=288,
 ):
-    """历史回测；只模拟交易，不发送真实订单。"""
     if initial_capital <= 0:
         raise ValueError("初始资金必须大于 0。")
     if not 0 < risk_pct <= 0.01:
@@ -384,13 +391,11 @@ def run_backtest(
     }
 
     def entry_execution(side, price):
-        # 开多买入滑点向上；开空卖出滑点向下
         return price * (
             1 + slip_rate if side == "LONG" else 1 - slip_rate
         )
 
     def exit_execution(side, price):
-        # 平多卖出滑点向下；平空买入滑点向上
         return price * (
             1 - slip_rate if side == "LONG" else 1 + slip_rate
         )
@@ -401,7 +406,6 @@ def run_backtest(
 
         ex = exit_execution(pos["side"], float(mark))
         direction = 1 if pos["side"] == "LONG" else -1
-
         gross = (
             (ex - pos["entry_exec"])
             * pos["qty"]
@@ -492,7 +496,6 @@ def run_backtest(
         stop = pos["stop"]
         target = pos["target"]
 
-        # 跳空时按开盘价处理；同一根K线同时触及止损止盈时先止损
         if side == "LONG":
             if op <= stop:
                 return op, "stop"
@@ -508,6 +511,7 @@ def run_backtest(
             hit_stop = hi >= stop
             hit_target = lo <= target
 
+        # 同一根K线触及止损和止盈时，保守地先计止损
         if hit_stop:
             return stop, "stop"
         if hit_target:
@@ -584,7 +588,6 @@ def run_backtest(
         next_bar = x.iloc[i + 1]
         entry_ref = float(next_bar["open"])
 
-        # 下一根开盘已穿越止损价，放弃该信号
         if (
             (side == "LONG" and entry_ref <= stop)
             or (side == "SHORT" and entry_ref >= stop)
@@ -669,7 +672,6 @@ def run_backtest(
 
         diagnostics["entries"] += 1
 
-    # 数据结束仍有持仓时，按最后收盘价强制平仓
     if position is not None:
         last = x.iloc[-1]
         trigger = float(last["close"])
@@ -709,13 +711,11 @@ def run_backtest(
         win_rate = float(
             (trades_df["net_pnl"] > 0).mean() * 100
         )
-
         profit_factor = (
             wins / losses
             if losses > 0
             else (float("inf") if wins > 0 else 0.0)
         )
-
         avg_pnl = float(trades_df["net_pnl"].mean())
         total_fees = float(trades_df["fees_est"].sum())
         trade_net_sum = float(trades_df["net_pnl"].sum())
